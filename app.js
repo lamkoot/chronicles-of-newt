@@ -7,7 +7,7 @@
 const CFG = Object.assign({ CLIENT_ID: '' }, window.CHRONICLES_CONFIG || {});
 const QS = new URLSearchParams(location.search);
 const DEMO = QS.has('demo') || !CFG.CLIENT_ID;
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const SCOPE = 'https://www.googleapis.com/auth/drive';
 const T_MEM = 'Herinneringen', T_SET = 'Instellingen', T_CH = 'Hoofdstukken';
 const COLS = ['id','type','datum','titel','tekst','notitie','tags','favoriet','gezondheidstype','ernst','symptomen','medicatie','duur_dagen','media','auteur','aangemaakt','bijgewerkt','verwijderd'];
@@ -102,8 +102,17 @@ async function dbOp(store, mode, fn) {
   });
 }
 const store = {
-  async get(s, k) { try { return await dbOp(s, 'readonly', st => st.get(k)); } catch { return memStore[s].get(k); } },
-  async set(s, k, v) { try { await dbOp(s, 'readwrite', st => st.put(v, k)); } catch { memStore[s].set(k, v); } },
+  async get(s, k) {
+    let v; try { v = await dbOp(s, 'readonly', st => st.get(k)); } catch {}
+    if (v === undefined || v === null) v = memStore[s].get(k);
+    if (v && v.__ab) v = new Blob([v.__ab], { type: v.type || '' });
+    return v;
+  },
+  async set(s, k, v) {
+    try { await dbOp(s, 'readwrite', st => st.put(v, k)); return true; } catch {}
+    if (v instanceof Blob) { try { const ab = await v.arrayBuffer(); await dbOp(s, 'readwrite', st => st.put({ __ab: ab, type: v.type }, k)); return true; } catch {} }
+    memStore[s].set(k, v); return false;
+  },
   async del(s, k) { try { await dbOp(s, 'readwrite', st => st.delete(k)); } catch { memStore[s].delete(k); } },
 };
 
@@ -241,15 +250,44 @@ const Drive = {
       const body = new Blob([`--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: ${type}\r\n\r\n`, blob, `\r\n--${b}--`]);
       return gapi(`${UPLOAD}/files?uploadType=multipart&fields=id`, { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${b}` }, body });
     }
-    const init = await gapi(`${UPLOAD}/files?uploadType=resumable&fields=id`, { method: 'POST', raw: true, json: meta, headers: { 'X-Upload-Content-Type': type } });
+    const init = await gapi(`${UPLOAD}/files?uploadType=resumable&fields=id`, { method: 'POST', raw: true, json: meta, headers: { 'X-Upload-Content-Type': type, 'X-Upload-Content-Length': String(blob.size) } });
     const loc = init.headers.get('Location'); if (!loc) throw new Error('Upload kon niet starten');
-    const r = await fetch(loc, { method: 'PUT', headers: { 'Content-Type': type }, body: blob });
-    if (!r.ok) throw new Error('Upload mislukt (' + r.status + ')');
-    return r.json();
+    // In stukken van 8 MB, met voortgang en tot 4 pogingen per stuk (mobiel internet valt weleens weg)
+    const CH = 8 * 1024 * 1024, total = blob.size;
+    let start = 0;
+    while (start < total) {
+      const end = Math.min(start + CH, total);
+      let res = null, err = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try { res = await putChunk(loc, blob.slice(start, end), start, end, total, type, meta.name); err = null; break; }
+        catch (e) { err = e; await new Promise(r => setTimeout(r, 1500 * (attempt + 1))); }
+      }
+      if (err) throw err;
+      if (res.done) { setUpload(null); return res.json; }
+      start = res.next ?? end;
+    }
+    throw new Error('Upload onvolledig');
   },
   media: (id) => gapi(`${DRIVE}/files/${id}?alt=media`, { blob: true }),
   share: (id, email, role) => gapi(`${DRIVE}/files/${id}/permissions?sendNotificationEmail=true&fields=id`, { method: 'POST', json: { type: 'user', role, emailAddress: email } }),
 };
+function setUpload(u) { S.upload = u; renderBanner(); }
+function putChunk(loc, part, start, end, total, type, name) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', loc);
+    x.setRequestHeader('Content-Type', type);
+    x.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${total}`);
+    x.upload.onprogress = (e) => setUpload({ name, pct: Math.round(((start + (e.loaded || 0)) / total) * 100) });
+    x.onload = () => {
+      if (x.status === 200 || x.status === 201) { let j = {}; try { j = JSON.parse(x.responseText); } catch {} resolve({ done: true, json: j }); }
+      else if (x.status === 308) { const r = x.getResponseHeader('Range'); const m = r && /bytes=0-(\d+)/.exec(r); resolve({ done: false, next: m ? +m[1] + 1 : end }); }
+      else reject(new Error('Upload mislukt (' + x.status + ')'));
+    };
+    x.onerror = () => reject(new Error('Verbinding weggevallen tijdens upload'));
+    x.send(part);
+  });
+}
 const Sheets = {
   batchGet: (id, ranges) => gapi(`${SHEETS}/${id}/values:batchGet?${ranges.map(r => 'ranges=' + encodeURIComponent(r)).join('&')}&valueRenderOption=UNFORMATTED_VALUE`),
   get: (range) => gapi(`${SHEETS}/${S.sheetId}/values/${encodeURIComponent(range)}?valueRenderOption=UNFORMATTED_VALUE`),
@@ -353,7 +391,7 @@ async function uploadMedia(it) {
     if (m.id || !m.local) continue;
     const base = `${it.datum} ${TYPES[it.type].label.toLowerCase()} ${it.id.slice(-5)}-${n}`;
     const full = await store.get('blobs', m.local);
-    if (!full) { m._missing = true; continue; }
+    if (!full) { m._missing = true; S.lost = (S.lost || 0) + 1; continue; }
     const ext = m.kind === 'video' ? (m.mime.split('/')[1] || 'mp4').replace('quicktime', 'mov') : 'jpg';
     const f = await Drive.upload(full, { name: `${base}.${ext}`, parents: [S.mediaFolderId], description: `${naam()} · ${it.titel || it.tekst || ''}`.slice(0, 500) });
     let thumbId = '';
@@ -390,7 +428,7 @@ async function sync(quiet = true) {
     if (!quiet) toast('Alles is bijgewerkt');
   } catch (e) {
     if (!(e instanceof AuthError)) { S.error = e.message; console.error(e); }
-  } finally { S.syncing = false; render(); }
+  } finally { S.syncing = false; S.upload = null; render(); }
 }
 async function setSetting(key, val) {
   S.settings[key] = val; await saveCache();
@@ -433,6 +471,7 @@ async function hydrate(root = document) {
   const imgs = [...root.querySelectorAll('img[data-it]:not([src])')];
   await Promise.all(imgs.map(async (img) => {
     const it = S.items.find(i => i.id === img.dataset.it); const m = it?.media?.[+img.dataset.ix]; if (!m) return;
+    if (m.kind === 'video' && !m.thumb && !m.thumbLocal) return;
     const cell = img.closest('.mcell, .cover');
     try { const u = await mediaURL(m, 'thumb'); if (u) { cell?.classList.remove('err'); img.onload = () => img.classList.add('ld'); img.src = u; } }
     catch (e) { cell?.classList.add('err'); if (e instanceof AuthError) armReconnect(); }
@@ -451,13 +490,16 @@ async function resizeImage(src, max, q = 0.85) {
 async function processFile(file) {
   if (file.type.startsWith('video/')) {
     const poster = await new Promise((res) => {
-      const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.preload = 'auto';
-      const done = (b) => { clearTimeout(t); res(b); };
-      const t = setTimeout(() => done(null), 8000);
-      v.onloadeddata = () => { try { v.currentTime = Math.min(0.5, (v.duration || 1) / 2); } catch { done(null); } };
-      v.onseeked = async () => done(await resizeImage(v, 480, 0.8));
+      const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.preload = 'auto'; v.setAttribute('playsinline', '');
+      let fin = false; const done = (b) => { if (fin) return; fin = true; clearTimeout(t); try { v.pause(); URL.revokeObjectURL(v.src); } catch {} res(b); };
+      const t = setTimeout(() => done(null), 6000);
+      const grab = async () => { try { if (v.videoWidth) done(await resizeImage(v, 480, 0.8)); } catch { done(null); } };
+      v.onloadeddata = () => { try { v.currentTime = Math.min(0.5, (v.duration || 1) / 2); } catch { grab(); } };
+      v.onseeked = grab;
       v.onerror = () => done(null);
       v.src = URL.createObjectURL(file);
+      // iOS laadt pas beeld na play(); stil afspelen mag zonder tik
+      v.play?.().then(() => setTimeout(() => { v.pause(); if (!fin) grab(); }, 300)).catch(() => {});
     });
     return { full: file, thumb: poster, kind: 'video', mime: file.type || 'video/mp4', name: file.name };
   }
@@ -738,7 +780,7 @@ function renderSheet() {
   document.body.style.overflow = 'hidden';
   const sh = root.querySelector('.sheet'); sh.scrollTop = scroll;
   const af = sh.querySelector('[autofocus]'); if (af && !renderSheet._focused) { renderSheet._focused = true; setTimeout(() => af.focus(), 60); }
-  if (S.sheet === 'form') S.draft.media.forEach(async (m, ix) => { const img = sh.querySelector(`img[data-dm="${ix}"]`); if (img) img.src = m.preview || await mediaURL(m, 'thumb').catch(() => ''); });
+  if (S.sheet === 'form') S.draft.media.forEach(async (m, ix) => { const img = sh.querySelector(`img[data-dm="${ix}"]`); if (img) img.src = m.preview || (m.kind === 'video' && !m.thumb && !m.thumbLocal ? '' : await mediaURL(m, 'thumb').catch(() => '')); });
   hydrate(sh);
 }
 function openSheet(s) { renderSheet._focused = false; S.sheet = s; S.confirmDel = null; renderSheet(); }
@@ -762,6 +804,11 @@ async function openLightbox(id, ix) {
       const el = document.createElement(m.kind === 'video' ? 'video' : 'img');
       if (m.kind === 'video') { el.controls = true; el.playsInline = true; el.autoplay = true; }
       el.src = u; box.querySelector('.spinner').replaceWith(el);
+      if (m.kind === 'video' && m.id) {
+        const a = document.createElement('a'); a.href = `https://drive.google.com/file/d/${m.id}/view`; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = 'Speelt niet af? Open in Google Drive'; a.style.cssText = 'position:absolute;bottom:calc(16px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);color:#fff;background:rgba(255,255,255,.15);padding:8px 14px;border-radius:999px;font-size:14px;text-decoration:none';
+        box.appendChild(a);
+      }
     } catch (e) { box.querySelector('.spinner').outerHTML = `<p style="color:#fff">Kon niet laden${navigator.onLine ? '' : ' (offline)'}.</p>`; }
   };
   document.body.appendChild(box); show();
@@ -804,6 +851,8 @@ function renderBanner() {
   else if (S.needAuth || (!Auth.valid() && S.sheetId)) h = `<div class="bar">${pc ? plural(pc, 'herinnering wacht', 'herinneringen wachten') + ' om bewaard te worden.' : 'Verbind opnieuw met Google om foto\'s te zien en te bewaren.'} <button data-a="connect">Verbinden</button></div>`;
   else if (!navigator.onLine) h = `<div class="bar soft">Offline${pc ? ` — ${plural(pc, 'herinnering', 'herinneringen')} ${pc === 1 ? 'wordt' : 'worden'} later bewaard` : ''}</div>`;
   else if (S.error) h = `<div class="bar soft">Kon niet synchroniseren: ${esc(S.error)} <button data-a="sync-now">Opnieuw</button></div>`;
+  else if (S.upload) h = `<div class="bar soft">Bezig met uploaden${S.upload.pct != null ? ` · ${S.upload.pct}%` : ''} — houd de app open</div>`;
+  else if (S.lost) h = `<div class="bar soft">${plural(S.lost, 'bestand kon', 'bestanden konden')} niet worden geüpload omdat de app tussendoor gesloten was. Voeg ${S.lost === 1 ? 'het' : 'ze'} opnieuw toe. <button data-a="dismiss-lost">OK</button></div>`;
   else if (S.syncing && pc) h = `<div class="bar soft">Bezig met bewaren in Drive…</div>`;
   el.innerHTML = h;
 }
@@ -864,13 +913,14 @@ async function saveDraft() {
 async function addFiles(files) {
   const d = S.draft; if (!d) return;
   for (const file of files) {
-    if (file.size > 300e6) { toast(`${file.name} is te groot (max 300 MB)`); continue; }
+    if (file.size > 1.5e9) { toast(`${file.name} is te groot (max 1,5 GB)`); continue; }
     d.busy++; renderSheet();
     try {
       const p = await processFile(file);
       const key = uid();
-      await store.set('blobs', 'f' + key, p.full);
+      const stored = await store.set('blobs', 'f' + key, p.full);
       if (p.thumb) await store.set('blobs', 't' + key, p.thumb);
+      if (!stored) toast('Houd de app open tot het filmpje is geüpload');
       if (S.draft !== d) { store.del('blobs', 'f' + key); store.del('blobs', 't' + key); return; }
       d.media.push({ local: 'f' + key, thumbLocal: p.thumb ? 't' + key : '', kind: p.kind, mime: p.mime, name: p.name, preview: p.thumb ? URL.createObjectURL(p.thumb) : '' });
     } catch (e) { console.error(e); toast('Kon ' + file.name + ' niet verwerken'); }
@@ -914,6 +964,7 @@ const actions = {
   'cancel-intro': () => { S.editIntro = null; render(); },
   'save-intro': async (el) => { const y = +el.dataset.y; const t = $('#intro-ta').value.trim(); S.editIntro = null; try { await setChapterIntro(y, t); toast('Inleiding bewaard'); } catch (e) { toast('Bewaren mislukt: ' + e.message); } render(); },
   print: () => window.print(),
+  'dismiss-lost': () => { S.lost = 0; renderBanner(); },
   login: async () => { try { await Auth.request(''); await afterLogin(); } catch (e) { toast(e.message); } },
   connect: async () => { try { await Auth.request(''); S.needAuth = false; renderBanner(); if (!S.user) await afterLogin(); else { render(); sync(); } } catch (e) { toast(e.message); } },
   research: async (el) => { try { const files = await Drive.find(); if (files.length === 1) { useArchive(files[0].id, files[0].capabilities?.canEdit !== false); await afterLogin(); } else if (files.length > 1) { S.candidates = files; go('pick'); } else toast('Nog geen gedeeld archief gevonden'); } catch (e) { toast(e.message); } },
