@@ -7,7 +7,7 @@
 const CFG = Object.assign({ CLIENT_ID: '' }, window.CHRONICLES_CONFIG || {});
 const QS = new URLSearchParams(location.search);
 const DEMO = QS.has('demo') || !CFG.CLIENT_ID;
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const SCOPE = 'https://www.googleapis.com/auth/drive';
 const T_MEM = 'Herinneringen', T_SET = 'Instellingen', T_CH = 'Hoofdstukken';
 const COLS = ['id','type','datum','titel','tekst','notitie','tags','favoriet','gezondheidstype','ernst','symptomen','medicatie','duur_dagen','media','auteur','aangemaakt','bijgewerkt','verwijderd'];
@@ -199,6 +199,19 @@ const Auth = {
   signOut() { try { if (this.token) google.accounts.oauth2.revoke(this.token, () => {}); } catch {} this.token = null; ls.del('cn_token'); },
 };
 
+/* Bij de eerste tik na het openen: stil opnieuw verbinden (een popup mag alleen na een tik) */
+let reconnectArmed = false;
+function armReconnect() {
+  if (DEMO || reconnectArmed || Auth.valid() || !S.sheetId) return;
+  reconnectArmed = true;
+  const go = (e) => {
+    document.removeEventListener('pointerdown', go, true);
+    reconnectArmed = false;
+    if (Auth.valid() || !Auth.client || e.target.closest?.('[data-a="connect"],[data-a="login"],[data-a="sync-now"]')) return;
+    Auth.request('').then(async () => { S.needAuth = false; renderBanner(); if (!S.user) await afterLogin(); else await sync(); }).catch(() => {});
+  };
+  document.addEventListener('pointerdown', go, true);
+}
 async function gapi(url, o = {}) {
   if (!Auth.valid()) { S.needAuth = true; renderBanner(); throw new AuthError('auth'); }
   const headers = Object.assign({ Authorization: 'Bearer ' + Auth.token }, o.headers || {});
@@ -420,7 +433,9 @@ async function hydrate(root = document) {
   const imgs = [...root.querySelectorAll('img[data-it]:not([src])')];
   await Promise.all(imgs.map(async (img) => {
     const it = S.items.find(i => i.id === img.dataset.it); const m = it?.media?.[+img.dataset.ix]; if (!m) return;
-    try { const u = await mediaURL(m, 'thumb'); if (u) { img.onload = () => img.classList.add('ld'); img.src = u; } } catch (e) { /* offline of geen toegang */ }
+    const cell = img.closest('.mcell, .cover');
+    try { const u = await mediaURL(m, 'thumb'); if (u) { cell?.classList.remove('err'); img.onload = () => img.classList.add('ld'); img.src = u; } }
+    catch (e) { cell?.classList.add('err'); if (e instanceof AuthError) armReconnect(); }
   }));
 }
 function loadImage(file) {
@@ -707,6 +722,7 @@ function sheetDetail(it) {
   ${it.tags.length ? `<div class="wrapchips" style="margin-top:14px">${it.tags.map(t => `<button class="chip" data-a="tag" data-v="${esc(t)}">${esc(t)}</button>`).join('')}</div>` : ''}
   <div class="by">${it.auteur ? 'Vastgelegd door ' + esc(it.auteur) : ''}${it.aangemaakt ? ' · ' + esc(new Date(it.aangemaakt).toLocaleDateString('nl-NL')) : ''}</div>
   ${S.canEdit ? `<div class="actions"><button class="btn small" data-a="edit" data-id="${it.id}">${I('edit')} Bewerken</button>
+    <button class="btn ghost small" data-a="add-photos" data-id="${it.id}">${I('camera')} Foto's toevoegen</button>
     <button class="btn ghost small" data-a="fav" data-id="${it.id}">${I('star')} ${it.favoriet ? 'Geen favoriet' : 'Favoriet'}</button>
     <button class="btn danger small" data-a="del" data-id="${it.id}">${I('trash')} ${confirm ? 'Zeker weten?' : 'Verwijderen'}</button></div>` : ''}</div>`;
 }
@@ -785,7 +801,7 @@ function renderBanner() {
   const pc = pendingCount();
   if (DEMO) h = `<div class="bar soft">Demomodus — herinneringen blijven alleen op dit apparaat</div>`;
   else if (['welcome', 'setup', 'pick'].includes(S.view)) h = '';
-  else if (S.needAuth || (!Auth.valid() && S.sheetId)) h = `<div class="bar">${pc ? plural(pc, 'herinnering wacht', 'herinneringen wachten') + ' om bewaard te worden.' : 'Verbinding met Google verlopen.'} <button data-a="connect">Verbinden</button></div>`;
+  else if (S.needAuth || (!Auth.valid() && S.sheetId)) h = `<div class="bar">${pc ? plural(pc, 'herinnering wacht', 'herinneringen wachten') + ' om bewaard te worden.' : 'Verbind opnieuw met Google om foto\'s te zien en te bewaren.'} <button data-a="connect">Verbinden</button></div>`;
   else if (!navigator.onLine) h = `<div class="bar soft">Offline${pc ? ` — ${plural(pc, 'herinnering', 'herinneringen')} ${pc === 1 ? 'wordt' : 'worden'} later bewaard` : ''}</div>`;
   else if (S.error) h = `<div class="bar soft">Kon niet synchroniseren: ${esc(S.error)} <button data-a="sync-now">Opnieuw</button></div>`;
   else if (S.syncing && pc) h = `<div class="bar soft">Bezig met bewaren in Drive…</div>`;
@@ -885,7 +901,12 @@ const actions = {
     S.confirmDel = null; closeSheet(); await saveCache(); render(); toast('Verwijderd'); sync();
   },
   tag: (el) => { S.f = { q: el.dataset.v, types: new Set(), year: '', age: '' }; closeSheet(); go('timeline'); },
-  lightbox: (el, e) => { e.stopPropagation(); openLightbox(el.dataset.id, +el.dataset.ix); },
+  lightbox: (el, e) => {
+    e.stopPropagation();
+    if (!DEMO && !Auth.valid()) { const it = S.items.find(i => i.id === el.dataset.id); const m = it?.media?.[+el.dataset.ix]; if (m && !m.local) return actions.connect(); }
+    openLightbox(el.dataset.id, +el.dataset.ix);
+  },
+  'add-photos': (el) => { actions.edit(el); $('#file-in').click(); },
   ftype: (el) => { const t = el.dataset.t; S.f.types.has(t) ? S.f.types.delete(t) : S.f.types.add(t); render(); },
   fclear: () => { S.f = { q: '', types: new Set(), year: '', age: '' }; render(); },
   chapter: (el) => go('chapter', el.dataset.y),
@@ -894,7 +915,7 @@ const actions = {
   'save-intro': async (el) => { const y = +el.dataset.y; const t = $('#intro-ta').value.trim(); S.editIntro = null; try { await setChapterIntro(y, t); toast('Inleiding bewaard'); } catch (e) { toast('Bewaren mislukt: ' + e.message); } render(); },
   print: () => window.print(),
   login: async () => { try { await Auth.request(''); await afterLogin(); } catch (e) { toast(e.message); } },
-  connect: async () => { try { await Auth.request(''); S.needAuth = false; renderBanner(); if (!S.user) await afterLogin(); else sync(); } catch (e) { toast(e.message); } },
+  connect: async () => { try { await Auth.request(''); S.needAuth = false; renderBanner(); if (!S.user) await afterLogin(); else { render(); sync(); } } catch (e) { toast(e.message); } },
   research: async (el) => { try { const files = await Drive.find(); if (files.length === 1) { useArchive(files[0].id, files[0].capabilities?.canEdit !== false); await afterLogin(); } else if (files.length > 1) { S.candidates = files; go('pick'); } else toast('Nog geen gedeeld archief gevonden'); } catch (e) { toast(e.message); } },
   pick: async (el) => { useArchive(el.dataset.id, el.dataset.edit === '1'); await afterLogin(); },
   'create-archive': async (el) => {
@@ -993,6 +1014,6 @@ async function boot() {
   const ok = await Auth.loadScript();
   if (!ok) { if (!S.sheetId) $('#app').innerHTML = `<section class="welcome"><h1>Offline</h1><p>Maak verbinding met internet om in te loggen.</p></section>`; return; }
   if (Auth.valid()) { try { if (!S.user || !S.sheetId) await afterLogin(); else sync(); } catch (e) { console.error(e); } }
-  else if (S.sheetId) { S.needAuth = true; renderBanner(); }
+  else if (S.sheetId) { S.needAuth = true; renderBanner(); armReconnect(); }
 }
 boot();

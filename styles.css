@@ -88,8 +88,10 @@ blockquote.q{font-family:var(--serif);font-style:italic;font-size:23px;line-heig
 .mgrid.n1{grid-template-columns:1fr}.mgrid.n2{grid-template-columns:1fr 1fr}
 .mcell{position:relative;aspect-ratio:1;background:var(--accent-soft);overflow:hidden}
 .mgrid.n1 .mcell{aspect-ratio:4/3}
-.mcell img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .3s}
+.mcell img{position:relative;z-index:1;width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .3s}
 .mcell img.ld{opacity:1}
+.mcell::before,.chap .cover::before{content:"";position:absolute;inset:0;background:center/28px no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a08c7a' stroke-width='1.6'%3E%3Crect x='3' y='5' width='18' height='14' rx='2'/%3E%3Ccircle cx='9' cy='10' r='2'/%3E%3Cpath d='M21 16l-5-5-8 8'/%3E%3C/svg%3E");opacity:.7}
+.mcell.err::after{content:"Tik om foto te laden";position:absolute;left:0;right:0;bottom:8px;text-align:center;font-size:11px;color:var(--muted)}
 .mcell .play{position:absolute;inset:0;display:grid;place-items:center;color:#fff}
 .mcell .play svg{width:38px;height:38px;filter:drop-shadow(0 1px 4px rgba(0,0,0,.5));fill:rgba(255,255,255,.9);stroke:none}
 .mcell .more{position:absolute;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.45);color:#fff;font-size:20px;font-weight:600}
@@ -194,7 +196,7 @@ textarea.quote{font-style:italic}
 .chapters{display:grid;gap:14px}
 .chap{display:flex;gap:16px;align-items:stretch;background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden;text-align:left;width:100%}
 .chap .cover{width:110px;flex:none;background:var(--accent-soft);position:relative;display:grid;place-items:center;color:var(--accent);font-family:var(--serif);font-size:40px}
-.chap .cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.chap .cover img{z-index:1;position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .chap .body{padding:16px 16px 16px 0}
 .chap .num{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
 .chap h3{font-size:23px;margin:2px 0 4px}
